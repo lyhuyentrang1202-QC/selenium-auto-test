@@ -1,4 +1,4 @@
-package org.pageUI;
+package pageUI;
 
 import org.openqa.selenium.By;
 
@@ -20,7 +20,7 @@ public class LoginPageUI {
     public static final By USERNAME_TEXTBOX = By.xpath("//input[@name='username']");
     
     // Input Password
-    public static final By PASSWORD_TEXTBOX = By.xpath("//input[@name='password'");
+    public static final By PASSWORD_TEXTBOX = By.xpath("//input[@name='password']");
     
     // Button Login
     public static final By LOGIN_BUTTON = By.xpath("//button[@type='submit']");

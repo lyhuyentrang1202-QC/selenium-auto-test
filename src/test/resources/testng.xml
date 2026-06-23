@@ -10,7 +10,7 @@
     
     <!-- Test Migration -->
     <test name="News Migration Tests">
-        <parameter name="url" value="https://sgddt-langson.ddns.net/Admin"/>
+        <parameter name="url" value="https://id.nentanggiaoduc.edu.vn/"/>
         <parameter name="browser" value="chrome"/>
         <classes>
             <class name="com.tests.NewsMigrationTest"/>
