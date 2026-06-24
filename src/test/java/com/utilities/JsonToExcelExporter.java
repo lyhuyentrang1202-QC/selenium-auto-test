@@ -1,338 +1,293 @@
 package com.utilities;
 
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
+import com.google.gson.*;
 import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.ss.util.CellRangeAddress;
 import org.apache.poi.xssf.usermodel.*;
 
-import java.io.File;
-import java.io.FileOutputStream;
-import java.nio.file.Files;
-import java.nio.file.Paths;
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+import java.util.stream.*;
 
 /**
- * Đọc file article.json (từ crawler LSN-SOGD) và xuất tài liệu Excel
- * mô tả các màn hình, trường dữ liệu và button theo schema trong README.
+ * Đọc toàn bộ file JSON crawl từ Orchard Core CMS và xuất ra Excel.
  *
- * Cách dùng:
- *   JsonToExcelExporter.main(new String[]{"path/to/article.json"})
- * hoặc:
- *   new JsonToExcelExporter().export("path/to/article.json", "output.xlsx")
+ * Cấu trúc Excel:
+ *   - Mỗi sheet = 1 ContentType (tên màn hình)
+ *   - Dòng 1 = tiêu đề sheet (merged)
+ *   - Dòng 2 = tên các trường (flattened dot-notation)
+ *   - Dòng 3+ = giá trị từ từng bài viết
+ *
+ * Cách chạy:
+ *   mvn exec:java -Dexec.mainClass="com.utilities.JsonToExcelExporter"
+ *   hoặc: java -cp ... com.utilities.JsonToExcelExporter [inputDir] [output.xlsx]
  */
 public class JsonToExcelExporter {
 
-    private static final String[] COL_HEADERS = {
-        "STT", "Loại", "Tên trường / Button", "JSON Key",
-        "Kiểu dữ liệu", "Bắt buộc", "Locator (CSS / XPath)", "Mô tả", "Giá trị mẫu (từ JSON)"
-    };
+    private static final int MAX_CELL_LEN = 500;
+
+    // Các field ưu tiên hiển thị đầu tiên trong header
+    private static final List<String> PRIORITY_KEYS = Arrays.asList(
+        "ContentItemId", "ContentType", "DisplayText", "Published", "Latest",
+        "TitlePart.Title",
+        "EtpArticleSourcePart.Source.Text",
+        "EtpTinTucSidebarPart.NgayXuatBan.Value",
+        "EtpArticlePromotionPart.IsFeaturedHome.Value"
+    );
 
     public static void main(String[] args) throws Exception {
-        String jsonPath   = args.length > 0 ? args[0] : "src/test/resources/testdata/article.json";
-        String outputPath = args.length > 1 ? args[1] : "target/test-documentation.xlsx";
-        new JsonToExcelExporter().export(jsonPath, outputPath);
-        System.out.println("Excel exported: " + outputPath);
+        String inputDir   = args.length > 0 ? args[0] : "src/test/resources/testdata";
+        String outputPath = args.length > 1 ? args[1] : "output/export.xlsx";
+        new JsonToExcelExporter().exportAll(inputDir, outputPath);
     }
 
-    public void export(String jsonFilePath, String outputPath) throws Exception {
-        JsonObject article = loadFirstArticle(jsonFilePath);
+    // ── Public API ────────────────────────────────────────────────────────────
+
+    public void exportAll(String inputDir, String outputPath) throws Exception {
+        // ContentType → danh sách bài viết (mỗi bài = Map fieldName→value)
+        Map<String, List<Map<String, String>>> sheetData = new LinkedHashMap<>();
+
+        List<Path> jsonFiles = Files.walk(Paths.get(inputDir))
+            .filter(p -> p.toString().endsWith(".json"))
+            .sorted()
+            .collect(Collectors.toList());
+
+        if (jsonFiles.isEmpty()) {
+            System.out.println("Không tìm thấy file JSON trong: " + inputDir);
+            return;
+        }
+
+        for (Path jsonFile : jsonFiles) {
+            System.out.println("Đang xử lý: " + jsonFile.getFileName());
+            List<JsonObject> items = parseOrchardJson(jsonFile.toString());
+            System.out.println("  → " + items.size() + " items");
+
+            for (JsonObject item : items) {
+                String contentType = getStr(item, "ContentType");
+                if (contentType.isEmpty()) {
+                    contentType = jsonFile.getFileName().toString().replace(".json", "");
+                }
+                Map<String, String> flat = flattenObject(item, "");
+                sheetData.computeIfAbsent(contentType, k -> new ArrayList<>()).add(flat);
+            }
+        }
 
         try (XSSFWorkbook wb = new XSSFWorkbook()) {
             Styles st = new Styles(wb);
 
-            buildIndexSheet(wb, st);
-            buildLoginSheet(wb, st, article);
-            buildNewsListSheet(wb, st, article);
-            buildNewsDetailSheet(wb, st, article);
+            for (Map.Entry<String, List<Map<String, String>>> entry : sheetData.entrySet()) {
+                String sheetName = safeSheetName(entry.getKey());
+                List<Map<String, String>> rows = entry.getValue();
+                List<String> columns = buildColumnOrder(rows);
+                writeSheet(wb, st, sheetName, columns, rows);
+            }
 
-            new File(outputPath).getParentFile().mkdirs();
+            Files.createDirectories(Paths.get(outputPath).getParent() != null
+                ? Paths.get(outputPath).getParent() : Paths.get("."));
             try (FileOutputStream fos = new FileOutputStream(outputPath)) {
                 wb.write(fos);
             }
         }
-        System.out.println("Done. File: " + new File(outputPath).getAbsolutePath());
+        System.out.println("\nXuất xong: " + new File(outputPath).getAbsolutePath());
     }
 
-    // ── JSON helpers ─────────────────────────────────────────────────────────
+    // ── JSON parsing ──────────────────────────────────────────────────────────
 
-    private JsonObject loadFirstArticle(String path) {
+    /** Hỗ trợ: Orchard format {steps:[{name:"Content",data:[...]}]}, array, hoặc object đơn lẻ */
+    private List<JsonObject> parseOrchardJson(String filePath) {
+        List<JsonObject> result = new ArrayList<>();
         try {
-            String raw = new String(Files.readAllBytes(Paths.get(path)));
-            JsonElement el = JsonParser.parseString(raw);
-            if (el.isJsonArray()) {
-                JsonArray arr = el.getAsJsonArray();
-                if (!arr.isEmpty() && arr.get(0).isJsonObject()) return arr.get(0).getAsJsonObject();
+            String raw = new String(Files.readAllBytes(Paths.get(filePath)));
+            JsonElement root = JsonParser.parseString(raw);
+
+            if (root.isJsonObject()) {
+                JsonObject rootObj = root.getAsJsonObject();
+                if (rootObj.has("steps")) {
+                    // Orchard Core CMS export format
+                    for (JsonElement step : rootObj.getAsJsonArray("steps")) {
+                        JsonObject stepObj = step.getAsJsonObject();
+                        if ("Content".equals(getStr(stepObj, "name")) && stepObj.has("data")) {
+                            for (JsonElement item : stepObj.getAsJsonArray("data")) {
+                                if (item.isJsonObject()) result.add(item.getAsJsonObject());
+                            }
+                        }
+                    }
+                } else {
+                    result.add(rootObj);
+                }
+            } else if (root.isJsonArray()) {
+                for (JsonElement el : root.getAsJsonArray()) {
+                    if (el.isJsonObject()) result.add(el.getAsJsonObject());
+                }
             }
-            if (el.isJsonObject()) return el.getAsJsonObject();
         } catch (Exception e) {
-            System.err.println("Cannot read JSON: " + e.getMessage());
+            System.err.println("  [LỖI] Không đọc được file: " + e.getMessage());
         }
-        return new JsonObject();
+        return result;
     }
 
-    /** Lấy giá trị tại dot-notation key, vd "thumbnail.url", "flags.isFeatured". */
-    private String val(JsonObject root, String dotKey) {
-        if (root == null || dotKey == null || dotKey.isEmpty()) return "";
-        try {
-            String[] parts = dotKey.split("\\.");
-            JsonObject cur = root;
-            for (int i = 0; i < parts.length - 1; i++) {
-                if (!cur.has(parts[i])) return "";
-                JsonElement e = cur.get(parts[i]);
-                if (!e.isJsonObject()) return "";
-                cur = e.getAsJsonObject();
+    // ── JSON flattening ───────────────────────────────────────────────────────
+
+    /** Flatten đệ quy: {TitlePart:{Title:"ABC"}} → {"TitlePart.Title": "ABC"} */
+    private Map<String, String> flattenObject(JsonObject obj, String prefix) {
+        Map<String, String> result = new LinkedHashMap<>();
+        for (Map.Entry<String, JsonElement> entry : obj.entrySet()) {
+            String key = prefix.isEmpty() ? entry.getKey() : prefix + "." + entry.getKey();
+            JsonElement val = entry.getValue();
+
+            if (val.isJsonNull()) {
+                result.put(key, "");
+            } else if (val.isJsonPrimitive()) {
+                result.put(key, truncate(val.getAsString()));
+            } else if (val.isJsonObject()) {
+                result.putAll(flattenObject(val.getAsJsonObject(), key));
+            } else if (val.isJsonArray()) {
+                result.put(key, flattenArray(val.getAsJsonArray()));
             }
-            String last = parts[parts.length - 1];
-            if (!cur.has(last)) return "";
-            JsonElement v = cur.get(last);
-            if (v.isJsonNull()) return "";
-            if (v.isJsonArray() || v.isJsonObject()) {
-                String s = v.toString();
-                return s.length() > 120 ? s.substring(0, 120) + "…" : s;
+        }
+        return result;
+    }
+
+    private String flattenArray(JsonArray arr) {
+        if (arr.isEmpty()) return "";
+        List<String> parts = new ArrayList<>();
+        for (JsonElement el : arr) {
+            if (el.isJsonNull()) parts.add("");
+            else if (el.isJsonPrimitive()) parts.add(el.getAsString());
+            else if (el.isJsonObject()) {
+                // Lấy value đơn giản nhất từ object (ưu tiên "Value", "Text", "Title", "Url")
+                JsonObject o = el.getAsJsonObject();
+                for (String k : Arrays.asList("Value", "Text", "Title", "Url", "Path")) {
+                    if (o.has(k) && o.get(k).isJsonPrimitive()) {
+                        parts.add(o.get(k).getAsString());
+                        break;
+                    }
+                }
+                // Nếu không có key ưu tiên, dùng toString rút gọn
+                if (parts.size() < arr.size()) parts.add(truncate(el.toString()));
+            } else {
+                parts.add(truncate(el.toString()));
             }
-            return v.getAsString();
-        } catch (Exception e) {
-            return "";
         }
+        String joined = String.join(" | ", parts);
+        return truncate(joined);
     }
 
-    private String clip(String s, int max) {
-        if (s == null || s.isEmpty()) return "";
-        return s.length() > max ? s.substring(0, max) + "…" : s;
-    }
+    // ── Column order ──────────────────────────────────────────────────────────
 
-    // ── Sheet builders ────────────────────────────────────────────────────────
+    private List<String> buildColumnOrder(List<Map<String, String>> rows) {
+        // Thu thập tất cả key từ tất cả rows
+        LinkedHashSet<String> allKeys = new LinkedHashSet<>();
+        for (Map<String, String> row : rows) allKeys.addAll(row.keySet());
 
-    private void buildIndexSheet(XSSFWorkbook wb, Styles st) {
-        XSSFSheet sh = wb.createSheet("Danh sach man hinh");
-        sh.setColumnWidth(0, 6 * 256);
-        sh.setColumnWidth(1, 32 * 256);
-        sh.setColumnWidth(2, 60 * 256);
-        sh.setColumnWidth(3, 25 * 256);
-
-        int r = 0;
-        r = mergedTitle(sh, st, r, "DANH SÁCH MÀN HÌNH TEST", 4);
-        r++;
-
-        Row hdr = sh.createRow(r++);
-        cell(hdr, 0, "STT", st.colHdr);
-        cell(hdr, 1, "Tên màn hình", st.colHdr);
-        cell(hdr, 2, "URL / Ghi chú", st.colHdr);
-        cell(hdr, 3, "Sheet tương ứng", st.colHdr);
-
-        Object[][] rows = {
-            {"1", "Đăng nhập",               "https://id.nentanggiaoduc.edu.vn/",                                          "Dang nhap"},
-            {"2", "Danh sách Tin Tức",        "https://sgddt-langson.ddns.net/Admin/EducationTrainingPortal/TinTuc",         "Danh sach Tin Tuc"},
-            {"3", "Chi tiết / Sửa Tin Tức",  "/Admin/EducationTrainingPortal/TinTuc/Edit/{id}",                             "Chi tiet Tin Tuc"},
-        };
-        for (Object[] d : rows) {
-            Row row = sh.createRow(r++);
-            for (int c = 0; c < d.length; c++) cell(row, c, (String) d[c], st.data);
+        // Priority keys trước, còn lại theo thứ tự xuất hiện
+        LinkedHashSet<String> ordered = new LinkedHashSet<>();
+        for (String k : PRIORITY_KEYS) {
+            if (allKeys.contains(k)) ordered.add(k);
         }
+        ordered.addAll(allKeys);
+        return new ArrayList<>(ordered);
     }
 
-    private void buildLoginSheet(XSSFWorkbook wb, Styles st, JsonObject article) {
-        XSSFSheet sh = wb.createSheet("Dang nhap");
-        applyWidths(sh);
-        int r = 0;
-        r = mergedTitle(sh, st, r, "MÀN ĐĂNG NHẬP", COL_HEADERS.length);
-        r++;
-        r = columnHeaders(sh, st, r);
+    // ── Excel writing ─────────────────────────────────────────────────────────
 
-        r = sectionRow(sh, st, r, "TRƯỜNG NHẬP LIỆU");
-        r = fieldRow(sh, st, r, 1, "Field",   "Tài khoản (Username)", "",         "string (text)",     "Có",     "//input[@name='username']",                                  "Nhập tên đăng nhập", "");
-        r = fieldRow(sh, st, r, 2, "Field",   "Mật khẩu (Password)",  "",         "string (password)", "Có",     "//input[@name='password']",                                  "Nhập mật khẩu", "");
-        r = fieldRow(sh, st, r, 3, "Display", "Thông báo lỗi",        "",         "string",            "Không",  ".alert-danger, .validation-summary-errors",                  "Hiển thị khi đăng nhập sai", "");
+    private void writeSheet(XSSFWorkbook wb, Styles st, String sheetName,
+                            List<String> columns, List<Map<String, String>> rows) {
+        XSSFSheet sh = wb.createSheet(sheetName);
+        sh.createFreezePane(0, 2); // Cố định 2 dòng đầu khi scroll
 
-        r = sectionRow(sh, st, r, "BUTTON");
-        r = fieldRow(sh, st, r, 1, "Button",  "Đăng nhập",            "",         "—",                 "—",      "//button[@type='submit']",                                   "Gửi form đăng nhập", "");
-        r = fieldRow(sh, st, r, 2, "Button",  "Quên mật khẩu",        "",         "—",                 "—",      "link text: Quên mật khẩu",                                   "Chuyển trang reset mật khẩu", "");
+        // Dòng 0: Tiêu đề sheet
+        Row titleRow = sh.createRow(0);
+        titleRow.setHeightInPoints(26);
+        Cell titleCell = titleRow.createCell(0);
+        titleCell.setCellValue(sheetName);
+        titleCell.setCellStyle(st.title);
+        if (columns.size() > 1) {
+            sh.addMergedRegion(new CellRangeAddress(0, 0, 0, columns.size() - 1));
+        }
+
+        // Dòng 1: Header (tên trường)
+        Row hdrRow = sh.createRow(1);
+        hdrRow.setHeightInPoints(18);
+        for (int c = 0; c < columns.size(); c++) {
+            Cell cell = hdrRow.createCell(c);
+            cell.setCellValue(columns.get(c));
+            cell.setCellStyle(st.header);
+            sh.setColumnWidth(c, columnWidth(columns.get(c)));
+        }
+
+        // Dòng 2+: Dữ liệu
+        for (int r = 0; r < rows.size(); r++) {
+            Row row = sh.createRow(r + 2);
+            row.setHeightInPoints(16);
+            Map<String, String> rowData = rows.get(r);
+            CellStyle cs = (r % 2 == 0) ? st.dataEven : st.dataOdd;
+            for (int c = 0; c < columns.size(); c++) {
+                Cell cell = row.createCell(c);
+                cell.setCellValue(rowData.getOrDefault(columns.get(c), ""));
+                cell.setCellStyle(cs);
+            }
+        }
+
+        System.out.printf("  Sheet %-30s: %3d dòng, %d cột%n", "\"" + sheetName + "\"", rows.size(), columns.size());
     }
 
-    private void buildNewsListSheet(XSSFWorkbook wb, Styles st, JsonObject article) {
-        XSSFSheet sh = wb.createSheet("Danh sach Tin Tuc");
-        applyWidths(sh);
-        int r = 0;
-        r = mergedTitle(sh, st, r, "MÀN DANH SÁCH TIN TỨC", COL_HEADERS.length);
-        r++;
-        r = columnHeaders(sh, st, r);
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
-        r = sectionRow(sh, st, r, "TRƯỜNG HIỂN THỊ / TÌM KIẾM");
-        r = fieldRow(sh, st, r, 1, "Display", "Tổng số bản ghi",      "",               "number",  "Không", "div.pagination-left.margin-right-xs",                         "Tổng số bài trong hệ thống", "");
-        r = fieldRow(sh, st, r, 2, "Field",   "Tìm theo tiêu đề",     "title",          "string",  "Không", "//input[@placeholder='Tìm theo tiêu đề...']",                 "Ô tìm kiếm bài theo tiêu đề", clip(val(article, "title"), 80));
-        r = fieldRow(sh, st, r, 3, "Display", "Tiêu đề bài (cột)",    "title",          "string",  "—",     "table tbody tr td a:first-of-type",                           "Link tiêu đề trong bảng",     clip(val(article, "title"), 80));
-        r = fieldRow(sh, st, r, 4, "Display", "Trạng thái (cột)",     "editorialStatus","string",  "—",     "table tbody tr .badge, table tbody tr .label",                "Badge trạng thái biên tập",   val(article, "editorialStatus"));
-
-        r = sectionRow(sh, st, r, "BUTTON");
-        r = fieldRow(sh, st, r, 1, "Button",  "Sửa / Edit",           "",               "—",       "—",     "table tbody tr a[href*='/Edit']",                             "Mở trang sửa bài viết", "");
-        r = fieldRow(sh, st, r, 2, "Button",  "Thêm mới",             "",               "—",       "—",     "a[href*='/Create'], .btn-create",                            "Tạo bài viết mới", "");
+    private String getStr(JsonObject obj, String key) {
+        return (obj.has(key) && !obj.get(key).isJsonNull()) ? obj.get(key).getAsString() : "";
     }
 
-    private void buildNewsDetailSheet(XSSFWorkbook wb, Styles st, JsonObject article) {
-        XSSFSheet sh = wb.createSheet("Chi tiet Tin Tuc");
-        applyWidths(sh);
-        int r = 0;
-        r = mergedTitle(sh, st, r, "MÀN CHI TIẾT / SỬA TIN TỨC", COL_HEADERS.length);
-        r++;
-        r = columnHeaders(sh, st, r);
-
-        // Thông tin cơ bản
-        r = sectionRow(sh, st, r, "THÔNG TIN CƠ BẢN");
-        r = fieldRow(sh, st, r, 1, "Field", "Tiêu đề",        "title",       "string",       "Có",    "input[id*='TitlePart']",                              "Tiêu đề bài viết",               clip(val(article, "title"), 100));
-        r = fieldRow(sh, st, r, 2, "Field", "Tiêu đề phụ",    "subTitle",    "string",       "Không", "input[id*='SubTitle'], input[name*='subTitle']",       "Tiêu đề phụ của bài",            val(article, "subTitle"));
-        r = fieldRow(sh, st, r, 3, "Field", "Tóm tắt",        "summary",     "string (text)","Không", "textarea[id*='brief'], textarea[name*='brief']",       "Tóm tắt ngắn (text thuần)",      clip(val(article, "summary"), 100));
-        r = fieldRow(sh, st, r, 4, "Field", "Nội dung (HTML)", "contentHtml", "string (HTML)","Không", "iframe.cke_wysiwyg_frame, .ck-editor__editable",      "CKEditor — nội dung bài",        "(HTML content)");
-        r = fieldRow(sh, st, r, 5, "Field", "Danh mục",       "category",    "string[]",     "Không", "select[id*='category'], input[id*='category']",        "Danh mục bài viết",              clip(val(article, "category"), 100));
-        r = fieldRow(sh, st, r, 6, "Field", "Từ khóa",        "keywords",    "string[]",     "Không", "input[id*='tag'], input[name*='tag']",                 "Từ khóa (phân cách bằng dấu phẩy)", clip(val(article, "keywords"), 100));
-        r = fieldRow(sh, st, r, 7, "Field", "Dòng sự kiện",   "eventFlow",   "string",       "Không", "input[id*='EventFlow'], input[name*='eventFlow']",     "Dòng sự kiện",                   val(article, "eventFlow"));
-        r = fieldRow(sh, st, r, 8, "Field", "Slug / URL đẹp", "friendlyUrl", "string",       "Không", "input[id*='rewriteURL'], input[name*='rewriteURL']",   "Đường dẫn thân thiện",           val(article, "friendlyUrl"));
-
-        // Ngày tháng
-        r = sectionRow(sh, st, r, "NGÀY THÁNG  (định dạng dd/MM/yyyy [HH:mm:ss] — múi giờ VN)");
-        r = fieldRow(sh, st, r, 1, "Field", "Ngày xuất bản",  "publishedAt", "date string",  "Không", "input[id*='NgayXuatBan'], input[name*='NgayXuatBan']", "VD: 05/09/2025 08:00:00",        val(article, "publishedAt"));
-        r = fieldRow(sh, st, r, 2, "Field", "Ngày ghim",      "pinDate",     "date string",  "Không", "input[id*='PinDate'], input[name*='pinDate']",         "Ghim bài lên đầu đến ngày này",  val(article, "pinDate"));
-        r = fieldRow(sh, st, r, 3, "Field", "Ngày hết hạn",   "expireDate",  "date string",  "Không", "input[id*='ExpireDate'], input[name*='expireDate']",   "Hết hạn hiển thị",               val(article, "expireDate"));
-
-        // Tác giả & Nguồn
-        r = sectionRow(sh, st, r, "TÁC GIẢ & NGUỒN");
-        r = fieldRow(sh, st, r, 1, "Field", "Tác giả",        "author",      "string",       "Không", "input[id*='Author'], input[name*='author']",           "Tên tác giả",                    val(article, "author"));
-        r = fieldRow(sh, st, r, 2, "Field", "Bút danh",       "penName",     "string",       "Không", "input[id*='PenName'], input[name*='penName']",         "Bút danh tác giả",               val(article, "penName"));
-        r = fieldRow(sh, st, r, 3, "Field", "Nguồn tin",      "source",      "string",       "Không", "input[id*='Source'], input[name*='source']",           "Nguồn gốc bài viết",             val(article, "source"));
-        r = fieldRow(sh, st, r, 4, "Field", "Người tạo",      "creator",     "string",       "Không", "(hiển thị — không chỉnh sửa được)",                   "Người tạo bài (từ list-scraper)", val(article, "creator"));
-
-        // Media
-        r = sectionRow(sh, st, r, "MEDIA");
-        r = fieldRow(sh, st, r, 1, "Field",   "Ảnh đại diện (URL)",       "thumbnail.url",   "URL/file", "Không", "input[id*='AnhDaiDien'], input[name*='AnhDaiDien']",   "URL ảnh đại diện bài",           val(article, "thumbnail.url"));
-        r = fieldRow(sh, st, r, 2, "Display", "Ảnh đại diện (alt)",       "thumbnail.alt",   "string",   "Không", "img[id*='AnhDaiDien'], .thumbnail-preview img",        "Alt text ảnh đại diện",          val(article, "thumbnail.alt"));
-        r = fieldRow(sh, st, r, 3, "Field",   "File đính kèm (danh sách)","attachments",     "object[]", "Không", "[id*='DanhSachFile'] li, .attachment-list li",         "Danh sách PDF/DOC/ZIP đính kèm", clip(val(article, "attachments"), 100));
-        r = fieldRow(sh, st, r, 4, "Field",   "Video (URL)",              "video.url",       "URL",      "Không", "input[id*='videoLink'], input[name*='videoLink']",      "Video nhúng (YouTube) hoặc upload", val(article, "video.url"));
-
-        // Flags / Cờ
-        r = sectionRow(sh, st, r, "CỜ / FLAGS (checkbox boolean)");
-        r = fieldRow(sh, st, r, 1, "Field", "Tin nổi bật",       "flags.isFeatured",  "boolean", "Không", "input[type='checkbox'][id*='IsFeaturedHome']",   "Đánh dấu tin nổi bật trang chủ",  val(article, "flags.isFeatured"));
-        r = fieldRow(sh, st, r, 2, "Field", "Tin tiêu điểm",     "flags.isFocus",     "boolean", "Không", "input[type='checkbox'][id*='IsFocus']",          "Đánh dấu tin tiêu điểm",          val(article, "flags.isFocus"));
-        r = fieldRow(sh, st, r, 3, "Field", "Đồng bộ tin tức",   "flags.syncNews",    "boolean", "Không", "input[type='checkbox'][id*='SyncNews']",         "Bật đồng bộ tin tức",             val(article, "flags.syncNews"));
-        r = fieldRow(sh, st, r, 4, "Field", "Yêu cầu đăng nhập", "flags.requireLogin","boolean", "Không", "input[type='checkbox'][id*='RequireLogin']",     "Bài cần đăng nhập mới xem",       val(article, "flags.requireLogin"));
-
-        // SEO
-        r = sectionRow(sh, st, r, "SEO");
-        r = fieldRow(sh, st, r, 1, "Field", "SEO Tiêu đề",   "seo.title",       "string", "Không", "input[id*='seoTitle'], input[name*='seoTitle']",                   "Meta title",       val(article, "seo.title"));
-        r = fieldRow(sh, st, r, 2, "Field", "SEO Mô tả",     "seo.description", "string", "Không", "textarea[id*='seoDescription'], textarea[name*='seoDescription']", "Meta description", clip(val(article, "seo.description"), 100));
-        r = fieldRow(sh, st, r, 3, "Field", "SEO Từ khóa",   "seo.keywords",    "string", "Không", "input[id*='seoKeywords'], input[name*='seoKeywords']",             "Meta keywords",    val(article, "seo.keywords"));
-
-        // Trạng thái (display)
-        r = sectionRow(sh, st, r, "TRẠNG THÁI (chỉ đọc — hiển thị trên form)");
-        r = fieldRow(sh, st, r, 1, "Display", "Trạng thái biên tập", "editorialStatus", "string", "—", ".badge-success, .status-published, span.badge",  "VD: Xuất bản / Lưu nháp / Chờ duyệt", val(article, "editorialStatus"));
-        r = fieldRow(sh, st, r, 2, "Display", "Trạng thái hiển thị", "displayStatus",   "string", "—", ".display-status, [class*='display-status']",      "Hiển thị bài viết / Ẩn bài viết",     val(article, "displayStatus"));
-
-        // Buttons
-        r = sectionRow(sh, st, r, "BUTTON");
-        r = fieldRow(sh, st, r, 1, "Button", "Lưu nháp",             "", "—", "—", "button[name='submit.Save'], button:contains('Lưu')",    "Lưu bài ở trạng thái nháp", "");
-        r = fieldRow(sh, st, r, 2, "Button", "Xuất bản",             "", "—", "—", "button[name='submit.Publish'], .btn-publish",            "Đổi trạng thái → Xuất bản",  "");
-        r = fieldRow(sh, st, r, 3, "Button", "Hủy xuất bản",         "", "—", "—", "button[name='submit.Unpublish'], .btn-unpublish",        "Gỡ bài đã xuất bản",         "");
-        r = fieldRow(sh, st, r, 4, "Button", "Xem trước",            "", "—", "—", "a[href*='preview'], .btn-preview",                      "Xem bài trên giao diện công khai", "");
-        r = fieldRow(sh, st, r, 5, "Button", "Quay lại danh sách",   "", "—", "—", "a[href*='TinTuc']:not([href*='Edit']), .btn-back",       "Quay về màn danh sách", "");
+    private String truncate(String s) {
+        if (s == null) return "";
+        return s.length() > MAX_CELL_LEN ? s.substring(0, MAX_CELL_LEN) + "…" : s;
     }
 
-    // ── Row writers ───────────────────────────────────────────────────────────
-
-    private int mergedTitle(XSSFSheet sh, Styles st, int rowNum, String title, int colSpan) {
-        Row row = sh.createRow(rowNum);
-        row.setHeightInPoints(28);
-        Cell c = row.createCell(0);
-        c.setCellValue(title);
-        c.setCellStyle(st.sheetTitle);
-        if (colSpan > 1)
-            sh.addMergedRegion(new CellRangeAddress(rowNum, rowNum, 0, colSpan - 1));
-        return rowNum + 1;
+    private String safeSheetName(String name) {
+        String safe = name.replaceAll("[\\[\\]:*?/\\\\]", "_");
+        return safe.length() > 31 ? safe.substring(0, 31) : safe;
     }
 
-    private int columnHeaders(XSSFSheet sh, Styles st, int rowNum) {
-        Row row = sh.createRow(rowNum);
-        row.setHeightInPoints(20);
-        for (int i = 0; i < COL_HEADERS.length; i++) cell(row, i, COL_HEADERS[i], st.colHdr);
-        return rowNum + 1;
-    }
-
-    private int sectionRow(XSSFSheet sh, Styles st, int rowNum, String label) {
-        Row row = sh.createRow(rowNum);
-        row.setHeightInPoints(18);
-        Cell c = row.createCell(0);
-        c.setCellValue(label);
-        c.setCellStyle(st.section);
-        sh.addMergedRegion(new CellRangeAddress(rowNum, rowNum, 0, COL_HEADERS.length - 1));
-        return rowNum + 1;
-    }
-
-    private int fieldRow(XSSFSheet sh, Styles st, int rowNum,
-                         int stt, String type, String name, String jsonKey,
-                         String dataType, String required, String locator,
-                         String desc, String sample) {
-        Row row = sh.createRow(rowNum);
-        row.setHeightInPoints(16);
-        CellStyle cs = type.equals("Button") ? st.buttonRow : st.dataRow;
-        cell(row, 0, String.valueOf(stt), cs);
-        cell(row, 1, type, cs);
-        cell(row, 2, name, cs);
-        cell(row, 3, jsonKey, cs);
-        cell(row, 4, dataType, cs);
-        cell(row, 5, required, cs);
-        cell(row, 6, locator, cs);
-        cell(row, 7, desc, cs);
-        cell(row, 8, sample, cs);
-        return rowNum + 1;
-    }
-
-    // ── Utilities ─────────────────────────────────────────────────────────────
-
-    private void applyWidths(XSSFSheet sh) {
-        int[] widths = {5, 10, 28, 28, 22, 10, 52, 35, 38};
-        for (int i = 0; i < widths.length; i++) sh.setColumnWidth(i, widths[i] * 256);
-    }
-
-    private void cell(Row row, int col, String value, CellStyle style) {
-        Cell c = row.createCell(col);
-        c.setCellValue(value == null ? "" : value);
-        c.setCellStyle(style);
+    private int columnWidth(String col) {
+        String lc = col.toLowerCase();
+        if (lc.contains("body") || lc.contains("html") || lc.contains("noidung")) return 60 * 256;
+        if (lc.contains("title") || lc.contains("displaytext") || lc.contains("tieude")) return 50 * 256;
+        if (lc.contains("id") && lc.length() < 20) return 32 * 256;
+        if (lc.contains("date") || lc.contains("ngay") || lc.contains("utc")) return 26 * 256;
+        if (lc.contains("path") || lc.contains("url") || lc.contains("source")) return 40 * 256;
+        return 22 * 256;
     }
 
     // ── Styles ────────────────────────────────────────────────────────────────
 
     private static class Styles {
-        final CellStyle sheetTitle, colHdr, section, dataRow, buttonRow, data;
+        final CellStyle title, header, dataEven, dataOdd;
 
         Styles(XSSFWorkbook wb) {
-            sheetTitle = build(wb, new int[]{31, 73, 125},  true,  13, true,  HorizontalAlignment.CENTER);
-            colHdr     = build(wb, new int[]{68, 114, 196}, true,  10, true,  HorizontalAlignment.CENTER);
-            section    = build(wb, new int[]{255, 242, 204},false, 10, true,  HorizontalAlignment.LEFT);
-            dataRow    = build(wb, new int[]{255, 255, 255},false, 10, false, HorizontalAlignment.LEFT);
-            buttonRow  = build(wb, new int[]{226, 239, 218},false, 10, false, HorizontalAlignment.LEFT);
-            data       = build(wb, new int[]{255, 255, 255},false, 10, false, HorizontalAlignment.LEFT);
+            title    = build(wb, new int[]{31,  73, 125}, true,  13, true);
+            header   = build(wb, new int[]{68, 114, 196}, true,  10, true);
+            dataEven = build(wb, new int[]{255, 255, 255}, false, 10, false);
+            dataOdd  = build(wb, new int[]{242, 242, 242}, false, 10, false);
         }
 
-        private CellStyle build(XSSFWorkbook wb, int[] bg, boolean whiteFg,
-                                int sz, boolean bold, HorizontalAlignment align) {
+        private CellStyle build(XSSFWorkbook wb, int[] bg, boolean whiteFg, int sz, boolean bold) {
             XSSFCellStyle s = wb.createCellStyle();
-            XSSFColor bgColor = new XSSFColor(
-                new byte[]{(byte) bg[0], (byte) bg[1], (byte) bg[2]}, null);
-            s.setFillForegroundColor(bgColor);
+            s.setFillForegroundColor(
+                new XSSFColor(new byte[]{(byte) bg[0], (byte) bg[1], (byte) bg[2]}, null));
             s.setFillPattern(FillPatternType.SOLID_FOREGROUND);
-
-            XSSFFont font = wb.createFont();
-            font.setFontHeightInPoints((short) sz);
-            font.setBold(bold);
-            if (whiteFg) font.setColor(IndexedColors.WHITE.getIndex());
-            s.setFont(font);
-
-            s.setAlignment(align);
+            XSSFFont f = wb.createFont();
+            f.setFontHeightInPoints((short) sz);
+            f.setBold(bold);
+            if (whiteFg) f.setColor(IndexedColors.WHITE.getIndex());
+            s.setFont(f);
+            s.setAlignment(HorizontalAlignment.LEFT);
             s.setVerticalAlignment(VerticalAlignment.CENTER);
             s.setBorderTop(BorderStyle.THIN);
             s.setBorderBottom(BorderStyle.THIN);
             s.setBorderLeft(BorderStyle.THIN);
             s.setBorderRight(BorderStyle.THIN);
-            s.setWrapText(true);
+            s.setWrapText(false);
             return s;
         }
     }
