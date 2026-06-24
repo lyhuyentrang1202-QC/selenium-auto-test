@@ -1,0 +1,37 @@
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - when: never
+
+stages:
+  - run test
+  - allure report
+
+run_test:
+  stage: run test
+  image: daw5sonvu/mvnedge:j26m3e138
+  script:
+    - mvn clean verify
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - target/allure-results
+
+generate_report:
+  stage: allure report
+  image: daw5sonvu/allure:3.34
+  needs:
+    - job: run_test
+      artifacts: true
+  script:
+    - allure generate --single-file --clean ./target/allure-results -o public
+  pages:
+    publish: public
+  when: always
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - public/
+  allow_failure: false

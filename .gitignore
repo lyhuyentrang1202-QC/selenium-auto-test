@@ -39,8 +39,5 @@ build/
 .DS_Store
 /.idea/
 
-### Output Excel files ###
-output/
-
 ### Test data (large crawler exports) ###
 src/test/resources/testdata/lsn-sogd-crawler/
