@@ -1,20 +1,24 @@
 <!DOCTYPE suite SYSTEM "https://testng.org/testng-1.0.dtd">
 <suite name="Migration Test Suite">
-    
-    <!-- Test đọc JSON -->
-    <test name="Read JSON Tests">
-        <classes>
-            <class name="com.tests.ReadJsonByKeyTest"/>
-        </classes>
-    </test>
-    
-    <!-- Test Migration -->
-    <test name="News Migration Tests">
-        <parameter name="url" value="https://id.nentanggiaoduc.edu.vn/"/>
+
+    <!-- Bước 1: Old UI (langson.edu.vn) vs JSON — xác nhận crawl chính xác -->
+    <test name="Old UI vs JSON">
+        <parameter name="url" value="https://langson.edu.vn/page/CMS/Admin/Article/list?&amp;type=Article.News&amp;groupId=5a80fae0a8b0a672cc074d28&amp;id=Article.News&amp;menuId=Article.News"/>
         <parameter name="browser" value="chrome"/>
         <classes>
-            <class name="com.tests.NewsMigrationTest"/>
+            <class name="com.tests.migration.OldUiVsJsonTest"/>
         </classes>
     </test>
-    
+
+    <!--
+    <test name="Read JSON Tests">
+        <classes><class name="com.tests.ReadJsonByKeyTest"/></classes>
+    </test>
+    <test name="New UI vs JSON">
+        <parameter name="url" value="https://sgddt-langson.ddns.net/Admin"/>
+        <parameter name="browser" value="chrome"/>
+        <classes><class name="com.tests.migration.NewsScreenMigrationTest"/></classes>
+    </test>
+    -->
+
 </suite>

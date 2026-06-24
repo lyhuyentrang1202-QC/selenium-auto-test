@@ -41,3 +41,6 @@ build/
 
 ### Test data (large crawler exports) ###
 src/test/resources/testdata/lsn-sogd-crawler/
+
+### Excel output ###
+output/

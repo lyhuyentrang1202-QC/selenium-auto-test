@@ -37,6 +37,11 @@ public class BaseTest {
             }
             case "chrome" -> {
                 ChromeOptions options = new ChromeOptions();
+                options.addArguments("--disable-gpu");
+                options.addArguments("--no-sandbox");
+                options.addArguments("--disable-dev-shm-usage");
+                options.addArguments("--autoplay-policy=user-gesture-required");
+                options.addArguments("--disable-features=AutoplayIgnoreWebAudio,MediaRouter");
                 driver = new ChromeDriver(options);
             }
             default -> throw new IllegalArgumentException("Browser không hỗ trợ: " + browser);
