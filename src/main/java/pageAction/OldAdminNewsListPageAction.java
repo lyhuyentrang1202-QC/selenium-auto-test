@@ -16,6 +16,7 @@ public class OldAdminNewsListPageAction {
 
     private final WebDriver driver;
     private final WebDriverWait wait;
+    private String lastKnownGroupId; // reuse across navigations when sidebar can't provide one
 
     public OldAdminNewsListPageAction() {
         this.driver = DriverManager.getDriver();
@@ -30,19 +31,20 @@ public class OldAdminNewsListPageAction {
      * @param articleType  type value (ví dụ: "Article.News", "Article.LegalDocument")
      */
     public void navigateToScreen(String articleType) {
-        // 1. Thử lấy groupId từ sidebar link ứng với type này
+        String base = "https://langson.edu.vn/page/CMS/Admin/Article/list";
+
+        // 1. Lấy groupId từ sidebar link
         String groupId = extractGroupIdFromSidebar(articleType);
 
-        // 2. Fallback: lấy từ URL hiện tại
+        // 2. Fallback: dùng groupId đã biết từ lần navigate trước
         if (groupId == null || groupId.isEmpty()) {
-            groupId = extractParam(driver.getCurrentUrl(), "groupId");
+            groupId = lastKnownGroupId;
         }
 
         if (groupId == null || groupId.isEmpty()) {
             System.err.println("[WARN] Không tìm được groupId cho: " + articleType);
         }
 
-        String base = "https://langson.edu.vn/page/CMS/Admin/Article/list";
         String url = base + "?type=" + articleType
             + (groupId != null && !groupId.isEmpty() ? "&groupId=" + groupId : "")
             + "&id=" + articleType
@@ -51,12 +53,21 @@ public class OldAdminNewsListPageAction {
         driver.get(url);
         waitForTable();
 
-        // 3. Nếu vẫn chưa có groupId, thử đọc lại từ pagination link trên trang vừa load
+        // 3. Nếu bị redirect sang login → session vẫn OK, thử lại qua sidebar click
+        if (driver.getCurrentUrl().contains("login")) {
+            System.err.println("[WARN] Bị redirect login khi navigate " + articleType + " — thử click sidebar");
+            if (tryClickSidebarLink(articleType)) {
+                System.out.println("  [Navigate] → " + articleType + " | URL: " + driver.getCurrentUrl());
+                updateLastKnownGroupId();
+                return;
+            }
+        }
+
+        // 4. Nếu vẫn chưa có groupId, đọc lại từ pagination link trên trang vừa load
         if (groupId == null || groupId.isEmpty()) {
             groupId = extractGroupIdFromPagination();
             if (groupId != null && !groupId.isEmpty()) {
                 System.out.println("  [Navigate] Lấy được groupId từ pagination: " + groupId);
-                // Reload với groupId đúng
                 url = base + "?type=" + articleType + "&groupId=" + groupId
                     + "&id=" + articleType + "&menuId=" + articleType;
                 driver.get(url);
@@ -64,7 +75,31 @@ public class OldAdminNewsListPageAction {
             }
         }
 
+        updateLastKnownGroupId();
         System.out.println("  [Navigate] → " + articleType + " | URL: " + driver.getCurrentUrl());
+    }
+
+    private void updateLastKnownGroupId() {
+        String g = extractParam(driver.getCurrentUrl(), "groupId");
+        if (g != null && !g.isEmpty()) lastKnownGroupId = g;
+    }
+
+    private boolean tryClickSidebarLink(String articleType) {
+        try {
+            String shortType = articleType.contains(".")
+                ? articleType.substring(articleType.lastIndexOf('.') + 1)
+                : articleType;
+            List<WebElement> links = driver.findElements(By.xpath(
+                "//a[contains(@href,'Article/list') and (contains(@href,'" + articleType + "') or contains(@href,'" + shortType + "'))]"));
+            if (links.isEmpty()) return false;
+            String href = links.get(0).getAttribute("href");
+            if (href == null || href.isEmpty()) return false;
+            driver.get(href);
+            waitForTable();
+            return !driver.getCurrentUrl().contains("login");
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     /** Đọc tổng số bản ghi ("Tổng số bản ghi: 1.873") */
@@ -82,10 +117,8 @@ public class OldAdminNewsListPageAction {
 
     /**
      * Đọc TOÀN BỘ rows qua pagination.
-     * Chiến lược:
-     *   1. Lấy total count trước để biết khi nào dừng
-     *   2. Thêm pageSize=50 vào URL (server có thể không honor, sẽ detect thực tế)
-     *   3. Paginate cho đến khi: không còn row HOẶC đã thu đủ total HOẶC trang này ít hơn trang 1
+     * Dừng khi: 0 rows trên trang, bị redirect sang login, hoặc đã đủ totalCount.
+     * Không thêm pageSize vào URL — để server dùng pageSize mặc định.
      */
     public List<Map<String, String>> getAllRows() {
         List<Map<String, String>> all = new ArrayList<>();
@@ -94,24 +127,25 @@ public class OldAdminNewsListPageAction {
         System.out.printf("  [Old UI] Total count: %d%n", totalCount);
 
         String baseUrl = driver.getCurrentUrl();
-        String pagedBase = setUrlParam(baseUrl, "pageSize", "50");
-
         int page = 1;
-        int firstPageRowCount = -1;
 
         while (true) {
-            String pageUrl = setUrlParam(pagedBase, "page", String.valueOf(page));
+            String pageUrl = setUrlParam(baseUrl, "page", String.valueOf(page));
             driver.get(pageUrl);
+
+            // Dừng sớm nếu bị redirect sang login (session hết hoặc URL sai)
+            if (driver.getCurrentUrl().contains("login")) {
+                System.err.printf("  [Old UI] Page %d → redirect login, dừng%n", page);
+                break;
+            }
+
             waitForTable();
 
             List<WebElement> rows = driver.findElements(OldAdminNewsListPageUI.TABLE_ROWS);
             if (rows.isEmpty()) {
-                System.out.printf("  [Old UI] Page %d — 0 rows → dừng%n", page);
+                System.out.printf("  [Old UI] Page %d → 0 rows → dừng%n", page);
                 break;
             }
-
-            // Ghi nhận page size thực tế từ trang 1 (server có thể không dùng pageSize=50)
-            if (page == 1) firstPageRowCount = rows.size();
 
             int added = 0;
             for (WebElement row : rows) {
@@ -129,16 +163,10 @@ public class OldAdminNewsListPageAction {
                 added++;
             }
 
-            System.out.printf("  [Old UI] Page %d — %d rows (tổng: %d/%d)%n",
+            System.out.printf("  [Old UI] Page %d → %d rows (tổng: %d/%d)%n",
                 page, added, all.size(), totalCount);
 
-            // Dừng khi:
-            // (a) trang này ít row hơn trang 1 → đây là trang cuối
-            // (b) đã thu đủ hoặc vượt total
-            boolean isLastPage = rows.size() < firstPageRowCount;
-            boolean hasEnough  = totalCount > 0 && all.size() >= totalCount;
-            if (isLastPage || hasEnough) break;
-
+            if (totalCount > 0 && all.size() >= totalCount) break;
             page++;
         }
 
@@ -192,17 +220,21 @@ public class OldAdminNewsListPageAction {
     }
 
     /**
-     * Tìm groupId từ sidebar link ứng với articleType.
-     * Sidebar có các link dạng: href="/page/CMS/Admin/Article/list?type=Article.News&groupId=XXX&..."
+     * Tìm groupId từ sidebar link ứng với articleType, dùng XPath để tránh CSS encoding issues.
      */
     private String extractGroupIdFromSidebar(String articleType) {
         try {
-            String selector = String.format(
-                OldAdminNewsListPageUI.SIDEBAR_LINK_WITH_GROUPID, articleType);
-            List<WebElement> links = driver.findElements(By.cssSelector(selector));
-            if (!links.isEmpty()) {
-                String href = links.get(0).getAttribute("href");
-                return extractParam(href, "groupId");
+            String shortType = articleType.contains(".")
+                ? articleType.substring(articleType.lastIndexOf('.') + 1)
+                : articleType;
+            // XPath tìm link có groupId và chứa articleType hoặc shortType trong href
+            for (String pattern : new String[]{articleType, shortType}) {
+                List<WebElement> links = driver.findElements(By.xpath(
+                    "//a[contains(@href,'groupId') and contains(@href,'" + pattern + "')]"));
+                if (!links.isEmpty()) {
+                    String href = links.get(0).getAttribute("href");
+                    return extractParam(href, "groupId");
+                }
             }
         } catch (Exception ignored) {}
         return null;
