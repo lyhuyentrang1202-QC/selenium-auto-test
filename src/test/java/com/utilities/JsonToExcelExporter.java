@@ -71,7 +71,7 @@ public class JsonToExcelExporter {
 
     public static void main(String[] args) throws Exception {
         String inputDir   = args.length > 0 ? args[0]
-            : "src/test/resources/testdata/lsn-sogd-crawler (1)/lsn-sogd-crawler";
+            : "src/test/resources/testdata/lsn-sogd-crawler/lsn-sogd-crawler";
         String outputPath = args.length > 1 ? args[1] : "output/export.xlsx";
         new JsonToExcelExporter().run(inputDir, outputPath);
     }

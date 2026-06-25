@@ -28,7 +28,7 @@ public class ArticleDataStore {
     private final Map<String, JsonObject> byId = new LinkedHashMap<>();
 
     private static final String ZIP_DIR =
-        "src/test/resources/testdata/lsn-sogd-crawler (1)/lsn-sogd-crawler";
+        "src/test/resources/testdata/lsn-sogd-crawler/lsn-sogd-crawler";
 
     // ── Singleton ─────────────────────────────────────────────────────────────
 

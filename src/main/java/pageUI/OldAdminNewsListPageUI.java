@@ -41,4 +41,14 @@ public class OldAdminNewsListPageUI {
     // Số bài Xuất bản (dùng để cross-check nhanh)
     public static final By PUBLISHED_COUNT = By.xpath(
         "//span[contains(@class,'status-item') and .//span[contains(text(),'Xuất bản:')]]");
+
+    // ── Sidebar / pagination links chứa groupId ───────────────────────────────
+
+    // Link sidebar trái chứa type= và groupId= (dùng để lấy đúng groupId cho từng loại)
+    public static final String SIDEBAR_LINK_WITH_GROUPID =
+        "a[href*='groupId'][href*='type=%s']";
+
+    // Link pagination chứa groupId (fallback)
+    public static final By PAGINATION_LINK_WITH_GROUPID =
+        By.cssSelector("ul.pagination a[href*='groupId'], .paging a[href*='groupId']");
 }

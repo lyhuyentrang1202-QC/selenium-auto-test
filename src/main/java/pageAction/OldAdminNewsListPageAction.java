@@ -23,29 +23,47 @@ public class OldAdminNewsListPageAction {
     }
 
     /**
-     * Navigate đến màn list của 1 loại article bằng URL.
-     * Lấy groupId từ URL hiện tại (đã đúng sau login), chỉ thay type/id/menuId.
+     * Navigate đến màn list của 1 loại article.
+     * Ưu tiên lấy groupId từ sidebar link trên trang hiện tại (chứa đúng groupId cho từng type).
+     * Fallback về URL không có groupId nếu không tìm được.
      *
      * @param articleType  type value (ví dụ: "Article.News", "Article.LegalDocument")
      */
     public void navigateToScreen(String articleType) {
-        String currentUrl = driver.getCurrentUrl();
+        // 1. Thử lấy groupId từ sidebar link ứng với type này
+        String groupId = extractGroupIdFromSidebar(articleType);
 
-        // Lấy groupId từ URL hiện tại
-        String groupId = extractParam(currentUrl, "groupId");
+        // 2. Fallback: lấy từ URL hiện tại
         if (groupId == null || groupId.isEmpty()) {
-            System.err.println("[WARN] Không tìm được groupId trong URL: " + currentUrl);
+            groupId = extractParam(driver.getCurrentUrl(), "groupId");
         }
 
-        // Xây dựng URL mới với type mới, giữ groupId
+        if (groupId == null || groupId.isEmpty()) {
+            System.err.println("[WARN] Không tìm được groupId cho: " + articleType);
+        }
+
         String base = "https://langson.edu.vn/page/CMS/Admin/Article/list";
         String url = base + "?type=" + articleType
-            + (groupId != null ? "&groupId=" + groupId : "")
+            + (groupId != null && !groupId.isEmpty() ? "&groupId=" + groupId : "")
             + "&id=" + articleType
             + "&menuId=" + articleType;
 
         driver.get(url);
         waitForTable();
+
+        // 3. Nếu vẫn chưa có groupId, thử đọc lại từ pagination link trên trang vừa load
+        if (groupId == null || groupId.isEmpty()) {
+            groupId = extractGroupIdFromPagination();
+            if (groupId != null && !groupId.isEmpty()) {
+                System.out.println("  [Navigate] Lấy được groupId từ pagination: " + groupId);
+                // Reload với groupId đúng
+                url = base + "?type=" + articleType + "&groupId=" + groupId
+                    + "&id=" + articleType + "&menuId=" + articleType;
+                driver.get(url);
+                waitForTable();
+            }
+        }
+
         System.out.println("  [Navigate] → " + articleType + " | URL: " + driver.getCurrentUrl());
     }
 
@@ -65,22 +83,22 @@ public class OldAdminNewsListPageAction {
     /**
      * Đọc TOÀN BỘ rows qua pagination.
      * Chiến lược:
-     *   1. Lấy URL hiện tại (đã có groupId đúng từ menu navigation)
-     *   2. Thêm pageSize=50 vào URL để giảm số trang
-     *   3. Paginate qua từng trang bằng URL (page=1, page=2...)
-     *   4. Dừng khi không còn row hoặc số row < pageSize
+     *   1. Lấy total count trước để biết khi nào dừng
+     *   2. Thêm pageSize=50 vào URL (server có thể không honor, sẽ detect thực tế)
+     *   3. Paginate cho đến khi: không còn row HOẶC đã thu đủ total HOẶC trang này ít hơn trang 1
      */
     public List<Map<String, String>> getAllRows() {
         List<Map<String, String>> all = new ArrayList<>();
 
-        // Lấy base URL hiện tại (đúng groupId, đúng type)
-        String baseUrl = driver.getCurrentUrl();
+        int totalCount = getTotalCount();
+        System.out.printf("  [Old UI] Total count: %d%n", totalCount);
 
-        // Thêm pageSize=50 — giảm từ ~93 trang xuống ~37 trang
-        int pageSize = 50;
-        String pagedBase = setUrlParam(baseUrl, "pageSize", String.valueOf(pageSize));
+        String baseUrl = driver.getCurrentUrl();
+        String pagedBase = setUrlParam(baseUrl, "pageSize", "50");
 
         int page = 1;
+        int firstPageRowCount = -1;
+
         while (true) {
             String pageUrl = setUrlParam(pagedBase, "page", String.valueOf(page));
             driver.get(pageUrl);
@@ -91,6 +109,9 @@ public class OldAdminNewsListPageAction {
                 System.out.printf("  [Old UI] Page %d — 0 rows → dừng%n", page);
                 break;
             }
+
+            // Ghi nhận page size thực tế từ trang 1 (server có thể không dùng pageSize=50)
+            if (page == 1) firstPageRowCount = rows.size();
 
             int added = 0;
             for (WebElement row : rows) {
@@ -108,10 +129,16 @@ public class OldAdminNewsListPageAction {
                 added++;
             }
 
-            System.out.printf("  [Old UI] Page %d — %d rows (tổng: %d)%n", page, added, all.size());
+            System.out.printf("  [Old UI] Page %d — %d rows (tổng: %d/%d)%n",
+                page, added, all.size(), totalCount);
 
-            // Trang cuối khi số row < pageSize
-            if (rows.size() < pageSize) break;
+            // Dừng khi:
+            // (a) trang này ít row hơn trang 1 → đây là trang cuối
+            // (b) đã thu đủ hoặc vượt total
+            boolean isLastPage = rows.size() < firstPageRowCount;
+            boolean hasEnough  = totalCount > 0 && all.size() >= totalCount;
+            if (isLastPage || hasEnough) break;
+
             page++;
         }
 
@@ -162,5 +189,35 @@ public class OldAdminNewsListPageAction {
     private String safeText(WebElement parent, By by) {
         try { return parent.findElement(by).getText().trim(); }
         catch (NoSuchElementException e) { return ""; }
+    }
+
+    /**
+     * Tìm groupId từ sidebar link ứng với articleType.
+     * Sidebar có các link dạng: href="/page/CMS/Admin/Article/list?type=Article.News&groupId=XXX&..."
+     */
+    private String extractGroupIdFromSidebar(String articleType) {
+        try {
+            String selector = String.format(
+                OldAdminNewsListPageUI.SIDEBAR_LINK_WITH_GROUPID, articleType);
+            List<WebElement> links = driver.findElements(By.cssSelector(selector));
+            if (!links.isEmpty()) {
+                String href = links.get(0).getAttribute("href");
+                return extractParam(href, "groupId");
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    /** Lấy groupId từ link phân trang trên trang hiện tại (fallback). */
+    private String extractGroupIdFromPagination() {
+        try {
+            List<WebElement> links = driver.findElements(
+                OldAdminNewsListPageUI.PAGINATION_LINK_WITH_GROUPID);
+            if (!links.isEmpty()) {
+                String href = links.get(0).getAttribute("href");
+                return extractParam(href, "groupId");
+            }
+        } catch (Exception ignored) {}
+        return null;
     }
 }
